@@ -14,7 +14,7 @@ module Rock
             attr_reader :config_dir
 
             ROCK_VCS_LOCATIONS = [
-                /gitorious.*\/rock(?:-[\w-]+)?\//,
+                #/gitorious.*\/rock(?:-[\w-]+)?\//,
                 /github.*\/rock(?:-[\w-]+)?\//,
                 /github.*\/orocos-toolchain\//]
 
@@ -108,11 +108,23 @@ module Rock
                         return
                     end
 
-
-                    status = pkg.importer.delta_between_tags(pkg, from_tag, to_tag)
+                    STDOUT.puts "For package #{pkg_name}"
+                    begin
+                        status = pkg.importer.delta_between_tags(pkg, from_tag, to_tag)
                     if status.uncommitted_code
                         ReleaseAdmin.warn "the #{pkg_name} package contains uncommitted modifications"
                     end
+                    rescue ArgumentError => e
+                        ReleaseAdmin.warn "the #{pkg_name} should not get tagged here, not creating release information"
+                        return result
+                    rescue NoMethodError => e
+                        ReleaseAdmin.warn "the #{pkg_name} does not support release info creation currently"
+                        return result
+                    rescue Autobuild::SubcommandFailed => e
+                        ReleaseAdmin.warn "Not creating release notes for unknown reasons for: #{pkg_name} (maybe it does not have tags at all?)"
+                        return result
+                    end
+
 
                     case status.status
                     when Autobuild::Importer::Status::UP_TO_DATE
@@ -575,7 +587,7 @@ module Rock
                 Autoproj.message "Creating the packages RC branch"
                 # Deal with the packages that are managed within Rock
                 packages_to_branch_out, packages_to_snapshot = packages.partition do |pkg|
-                    !excluded_by_user.include?(pkg.name) && rock_package?(pkg)
+                    !excluded_by_user.include?(pkg.name) && rock_package?(pkg) 
                 end
                 packages_to_branch_out.each_with_index do |pkg, i|
                     Autoproj.message "  [#{i + 1}/#{packages_to_branch_out.size}] #{pkg.name}"
@@ -673,6 +685,7 @@ module Rock
 
 
             desc "delete-rc", "delete a release candidate environment created with create-rc"
+            option :exclude, doc: "packages on which the RC branch should not be created", type: :array, default: []
             option :branch, desc: "the release candidate branch", type: :string, default: 'rock-rc'
             def delete_rc
                 packages = all_necessary_packages(manifest,'master')
@@ -715,7 +728,7 @@ module Rock
 
             desc "notes RELEASE_NAME LAST_RELEASE_NAME", "create a release notes file based on the package's changelogs. RELEASE_NAME is the name that will be given to the new release and LAST_RELEASE_NAME the name of an existing release"
             def notes(release_name, last_release_name)
-                packages = all_necessary_packages(manifest)
+                packages = all_necessary_packages(manifest,"master")
 
                 ops = Release.new
                 last_versions_file = ops.fetch_version_file(last_release_name)
@@ -725,7 +738,7 @@ module Rock
                     find_all { |name| name !~ /^pkg_set:/ }
 
                 packages_names = packages.map { |pkg| pkg.autobuild.name }
-                new_packages     = package_names - last_packages_names
+                new_packages     = packages_names - last_packages_names
                 obsolete_packages = last_packages_names - packages_names
 
                 errors = Array.new
@@ -739,18 +752,99 @@ module Rock
                     if changes
                         status << changes
                     else
-                        errors << changes
+                        errors << pkg_name 
                     end
                 end
 
-                template = File.join(TEMPLATE_DIR, "rock-release-notes.md.template")
+
+                template = File.join(File.dirname(__FILE__),"..","templates", "rock-release-notes.md.template")
                 erb = ERB.new(File.read(template))
 
+                sort_info = release_name.split("-").last
+
+                Autoproj.message "Creating Relase notes: #{File.join(config_dir,Release::RELEASE_NOTES)}" 
                 File.open(File.join(config_dir, Release::RELEASE_NOTES), 'w') do |io|
                     io.write erb.result(binding)
                 end
             end
+            
+            desc "push-labels", "This function pushes a specific label to the remote "
+            option :exclude, desc: "packages on which the RC branch should not be created", type: :array, default: []
+            def push_labels(label)
+                if label.nil?
+                    Autoproj.error "You must specify a label"
+                    return -1
+                end
 
+                local = options[:local]
+                packages = all_necessary_packages(manifest,'master')
+                
+                packages.each do |pkg|
+                    pkg.autobuild.import(checkout_only: true)
+                end
+
+                excluded_by_user = options[:exclude].flat_map do |entry|
+                    entry.split(',')
+                end
+                
+                # Deal with the packages that are managed within Rock
+                packages_to_handle, packages_to_snapshot = packages.partition do |pkg|
+                    !excluded_by_user.include?(pkg.name) && rock_package?(pkg)
+                end
+
+                packages_to_handle.each do |pkg|
+                    pkg = pkg.autobuild
+                    importer = pkg.importer
+                    if importer.nil?
+                        Autoproj.error "No importer for #{pkg.name}"
+                        return -1
+                    end
+                    if !importer.repository.include? "gitorious"
+                        importer.run_git_bare(pkg,"push","autobuild", label) 
+                    else
+                        Autoproj.warn "Workaround, you have to tag/commit pinning the branch for #{pkg.name} manually, because it is still on gitorious"
+                    end
+                end
+            end
+
+            desc "delete-labels", "This is a helper function if some developer has used a wrong release name"
+            option :exclude, desc: "packages on which the RC branch should not be created", type: :array, default: []
+            def delete_labels(label)
+                if label.nil?
+                    Autoproj.error "You must specify a label"
+                    return -1
+                end
+
+                local = options[:local]
+                packages = all_necessary_packages(manifest,'master')
+                
+                packages.each do |pkg|
+                    pkg.autobuild.import(checkout_only: true)
+                end
+
+                excluded_by_user = options[:exclude].flat_map do |entry|
+                    entry.split(',')
+                end
+                
+                # Deal with the packages that are managed within Rock
+                packages_to_handle, packages_to_snapshot = packages.partition do |pkg|
+                    !excluded_by_user.include?(pkg.name) && rock_package?(pkg)
+                end
+
+                packages_to_handle.each do |pkg|
+                    pkg = pkg.autobuild
+                    importer = pkg.importer
+                    if importer.nil?
+                        Autoproj.error "No importer for #{pkg.name}"
+                        return -1
+                    end
+                    begin
+                        importer.run_git_bare(pkg,"tag", "-d", label) 
+                    rescue Autobuild::SubcommandFailed => e
+                        #TODO should not catched this way
+                    end
+                end
+            end
 
             desc "create-pull-requests SOURCE TARGET", "this is needed during a release to create pull-requests for the rc back to master"
             option :exclude, desc: "packages on which the RC branch should not be created", type: :array, default: []
@@ -758,6 +852,10 @@ module Rock
             def create_pull_requests(source, target)
                 if source.nil? || target.nil?
                     Autoproj.error "You must specify a branch"
+                    exit -1
+                end
+                if(target != "master")
+                    Autoproj.error "Wrong use"
                     exit -1
                 end
 
@@ -792,19 +890,18 @@ module Rock
 #                    end
 
 #                    pkg.update(:only_local => true) #Can be done locally because update was done before
-                    needs_merge = !importer.run_git_bare(pkg,"branch", "-a", "--contains","remotes/autobuild/#{target}").any?{|e| e.strip == "remotes/autobuild/#{source}"} 
+                    needs_merge = !importer.run_git_bare(pkg,"branch", "-a", "--contains","remotes/autobuild/#{source}").any?{|e| e.strip == "remotes/autobuild/#{target}"} 
                     if needs_merge
                         Autoproj.message "Package #{pkg.name} needs a merge creating pull-request"
-                        if pkg.name == "simulation/imumodel"
-                            Dir.chdir(pkg.srcdir) do |dir|
-                                call = "hub pull-request -m 'Automatic rock-release PR: integrate rc-patches in master' -b #{target} -h #{source}"
-                                #binding.pry
+                        Dir.chdir(pkg.srcdir) do |dir|
+                            call = "hub pull-request -f -m 'Automatic rock-release PR: integrate rc-patches in master' -b #{target} -h #{source}"
+                            #binding.pry
+                                #STDOUT.puts call
                                 erg = system(call)
                                 if(!erg)
-                                    Autoproj.error "Could not run hub pull request, result is #{$?}"
-                                    return -1
+                                    Autoproj.error "Could not run hub pull request for #{pkg.name}, result is #{$?}"
+                                    #return -1
                                 end
-                            end
                         end
                     end
 
@@ -819,7 +916,7 @@ module Rock
             option :exclude, desc: "packages on which the RC branch should not be created", type: :array, default: []
             option :branch, desc: "the name of the stable branch", type: :string, default: 'rock-rc'
             def prepare(release_name)
-                packages = all_necessary_packages(manifest)
+                packages = all_necessary_packages(manifest,"master")
 
                 Autoproj.message "Checking out missing packages"
                 packages.each do |pkg|
@@ -852,13 +949,30 @@ module Rock
                     raise "failed to prepare #{failed_packages.size} packages"
                 end
 
+                version_path = File.join(config_dir, Release::RELEASE_VERSIONS)
                 Autoproj.message "Creating version file, and saving it in #{version_path}"
                 ops = Autoproj::Ops::Snapshot.new(manifest, keep_going: false)
                 versions = ops.snapshot_package_sets +
                     ops.snapshot_packages(packages.map { |pkg| pkg.autobuild.name })
                 versions = ops.sort_versions(versions)
 
-                version_path = File.join(config_dir, Release::RELEASE_VERSIONS)
+                #Workaround filter out branch and label setting because branch will deleted after publishing the release
+                versions.collect! do |a|
+                    elem = Hash.new
+                    a.each do |k,v|
+                        v.keep_if do |k2,v2|
+                            if k2 == "branch"
+                                !(!v["branch"].nil? && !v["tag"].nil?)
+                            else
+                                true
+                            end
+                        end
+                        elem[k] = v
+                    end
+                    elem
+                end
+
+
                 FileUtils.mkdir_p(File.dirname(version_path))
                 File.open(version_path, 'w') do |io|
                     YAML.dump(versions, io)
