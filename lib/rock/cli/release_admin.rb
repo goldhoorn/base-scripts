@@ -690,7 +690,9 @@ module Rock
             def delete_rc
                 packages = all_necessary_packages(manifest,'master')
                 branch = options['branch']
-                 
+
+                check_out_missing_packages('stable')
+
                 packages.each do |pkg|
                     pkg.autobuild.import(checkout_only: true)
                 end
@@ -714,6 +716,96 @@ module Rock
                     if pkg.name == "simulation/imumodel"
                         importer.run_git_bare(pkg,"push", "autobuild", ":#{branch}") 
                     end
+                end
+            end
+
+            desc "push-to-stable", "This step is needed after releasing a release, this puses the rock-rc state to stable (or creates a Pull-request for this if it is not a fast-forward operation)"
+            option :exclude, doc: "packages on which the RC branch should not be created", type: :array, default: ['base/scripts','slam/mtk']
+            def push_to_stable(branch)
+                if(branch.nil?)
+                    Autoproj.error "Please pass the tagname of current release"
+                    return -1
+                end
+                packages = all_necessary_packages(manifest, 'stable')
+
+                check_out_missing_packages('stable')
+
+                excluded_by_user = options[:exclude].flat_map do |entry|
+                    entry.split(',')
+                end
+                versions = Array.new
+
+                # Deal with the packages that are managed within Rock
+                packages_to_handle, packages_to_snapshot = packages.partition do |pkg|
+                    !excluded_by_user.include?(pkg.name) && rock_package?(pkg)
+                end
+
+                failed_packages = []
+
+                package_sets = manifest.each_remote_package_set.to_a
+
+                #Make sure working copy is clean becasue we need to switch branches in the repros
+                #TODO find another way?
+                package_sets.each_with_index do |pkg_set, i|
+                    pkg = pkg_set.create_autobuild_package
+                    if pkg.importer.class.has_uncommitted_changes?(pkg)
+                        Autoproj.error "Could not process, because #{pkg.name} has uncommited changes"
+                        return -1
+                    end
+                end
+                packages_to_handle.each do |pkg|
+                    if pkg.autobuild.importer.class.has_uncommitted_changes?(pkg.autobuild)
+                        Autoproj.error "Could not process, because #{pkg.name} has uncommited changes"
+                        return -1
+                    end
+                end
+
+#               The package set are not branched....
+#                Autoproj.message "Try to push rock-rc state to stable"
+#                package_sets.each_with_index do |pkg_set, i|
+#                    Autoproj.message "  [#{i}/#{package_sets.size}] #{pkg_set.repository_id}"
+#                    pkg = pkg_set.create_autobuild_package
+#                    pkg.importer.run_git_bare(pkg, 'remote', 'update')
+#                    if !pkg.importer.run_git_bare(pkg, 'push', 'autobuild', "+refs/tags/#{branch}:refs/heads/stable")
+#                        Autoproj.warn "postpruned: failed to push rock-15.05 state to stable for: #{pkg.name}"
+#                        failed_packages << pkg
+#                    end
+#                    Autoproj.info "updated: #{pkg.name}"
+#                end
+
+                packages_to_handle.each do |pkg|
+                    pkg = pkg.autobuild
+                    importer = pkg.importer
+                    pkg.importer.run_git_bare(pkg, 'remote', 'update')
+                    if !pkg.importer.run_git_bare(pkg, 'push', 'autobuild', "+refs/tags/#{branch}:refs/heads/stable")
+                        Autoproj.warn "postpruned: failed to push #{branch} state to stable for: #{pkg.name}"
+                        failed_packages << pkg
+                    end
+                    Autoproj.info "Pushed: #{pkg.name}"
+                end
+
+                finally_failed = []
+                failed_packages.each do |pkg|
+                    if !pkg.importer.run_git(pkg,"checkout","-b","stable_merge","+refs/tags/#{branch}")
+                        finally_failed << pkg
+                    end
+                    if !pkg.importer.run_git(pkg,"merge","-s","ours","+refs/heads/stable")
+                        finally_failed << pkg
+                    end
+                    if !pkg.importer.run_git(pkg,"push","autobuild","stable_merge:stable_merge")
+                        finally_failed << pkg
+                    end
+                    call = "hub pull-request -f -m 'Automatic rock-release PR: integrate rc-branch in stable' -b stable -h stable_merge"
+                    erg = system(call)
+                    if(!erg)
+                        Autoproj.error "Could not run hub pull request for #{pkg.name}, result is #{$?}"
+                        finally_failed << pkg
+                    end
+                    Autoproj.error "Breaking here for #{pkg.name}, because PR creation is untested"
+                end
+                Autoproj.warn "Finally failed packages, please post-process them manually: "
+                finally_failed.each do |pkg|
+                    Autoproj.warn pkg.name
                 end
             end
 
